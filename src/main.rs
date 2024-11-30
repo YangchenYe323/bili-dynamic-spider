@@ -111,11 +111,7 @@ async fn run_target(
             .await
             .context("Parse dynamic response from Bilibili")?;
 
-        let code = response
-            .get("code")
-            .expect("unreachable")
-            .as_i64()
-            .expect("unreachable");
+        let code = response.get("code").unwrap().as_i64().unwrap();
 
         if code != 0 {
             println!("获取用户动态失败: {:?}", response);
@@ -174,7 +170,7 @@ async fn run_target(
                     // get dynamic details
                     let get_detail_response: serde_json::Value =  client
                         .get(format!("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id={}&features=itemOpusStyle,opusBigCover,onlyfansVote", dynamic_id))
-                        .header("COOKIE", "SESSDATA=6ad06723%2C1748386869%2C9e5990b2")
+                        .header("COOKIE", format!("SESSDATA={}", bili.sess_data))
                         .send()
                         .await
                         .unwrap()
