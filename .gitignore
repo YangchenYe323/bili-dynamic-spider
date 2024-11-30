@@ -1,0 +1,9 @@
+/target
+
+# Test sample json
+*.json
+
+# Actual config
+spider.toml
+
+*.out

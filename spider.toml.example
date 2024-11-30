@@ -1,0 +1,12 @@
+[mirai]
+http_url = "http://localhost:7827"
+verify_key = "INITKEYLunaRyu"
+
+[bili]
+sess_data = "SESSDATA"
+
+[[target]]
+uid = 1234
+interval_sec = 10
+receiver_qq = 1234
+sender_qq = 1234
