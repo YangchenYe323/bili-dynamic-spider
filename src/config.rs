@@ -33,5 +33,5 @@ pub struct TargetConfig {
 pub async fn get_config_from_file(path: impl AsRef<Path>) -> anyhow::Result<Config> {
     let content = fs::read_to_string(path).await.context("Read config file")?;
 
-    Ok(toml::from_str(&content).context("Parse config file")?)
+    toml::from_str(&content).context("Parse config file")
 }
