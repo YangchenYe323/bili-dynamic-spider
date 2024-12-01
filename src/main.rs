@@ -46,11 +46,12 @@ pub struct Resource {
 
 lazy_static! {
     static ref RESOURCE: Resource = load_resource("./resource").expect("加载资源失败");
-    static ref WHITE: Rgba<u8> = [255, 255, 255, 255].into();
-    static ref BLACK: Rgba<u8> = [0, 0, 0, 255].into();
-    static ref GRAY: Rgba<u8> = [169, 169, 169, 255].into();
-    static ref PINK: Rgba<u8> = [251, 114, 153, 255].into();
 }
+
+const WHITE: Rgba<u8> = Rgba::<u8>([255, 255, 255, 255]);
+const BLACK: Rgba<u8> = Rgba::<u8>([0, 0, 0, 255]);
+const GRAY: Rgba<u8> = Rgba::<u8>([169, 169, 169, 255]);
+const PINK: Rgba<u8> = Rgba::<u8>([251, 114, 153, 255]);
 
 #[derive(Debug)]
 enum RichTextNode {
@@ -225,7 +226,7 @@ async fn run_target(
                     // 构建动态内容图片
                     let mut generator = PicGenerator::new(740, 10000);
 
-                    generator.draw_rectangle(0, 0, 10000, 740, *WHITE);
+                    generator.draw_rectangle(0, 0, 10000, 740, WHITE);
 
                     // TODO: what if user has no face?
                     let face = desc["user_profile"]["info"]["face"].as_str().unwrap();
@@ -248,7 +249,7 @@ async fn run_target(
 
                     generator.set_pos(175, 60);
 
-                    let uname_color = if vip { *PINK } else { *BLACK };
+                    let uname_color = if vip { PINK } else { BLACK };
 
                     // 绘制用户名和动态时间戳
                     generator.draw_text(
@@ -260,7 +261,7 @@ async fn run_target(
                     );
                     generator.draw_text(
                         &[&ts_str],
-                        &[*GRAY],
+                        &[GRAY],
                         &RESOURCE.text_normal_font,
                         TIP_SCALE,
                         None,
