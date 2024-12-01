@@ -193,7 +193,10 @@ async fn run_target(
             continue;
         }
 
-        let cards = response["data"]["cards"].as_array().unwrap();
+        let Some(cards) = response["data"]["cards"].as_array() else {
+            error!("没有获取到任何动态: {:?}", response);
+            continue;
+        };
 
         for card in cards.iter().rev() {
             let desc = &card["desc"];
