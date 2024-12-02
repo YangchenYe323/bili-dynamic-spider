@@ -6,6 +6,7 @@ use std::{
     io::{BufReader, Cursor},
     path::Path,
     str::FromStr,
+    time::Duration,
 };
 
 use ab_glyph::{FontArc, PxScale};
@@ -24,7 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sled::Tree;
 use tokio::task::JoinSet;
-use tracing::{debug, error, info, trace, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
 const TEXT_SCALE: PxScale = uniform_scale(30.0);
@@ -88,7 +89,7 @@ struct DbEntry {
 async fn main() -> anyhow::Result<()> {
     // set log collector
     let filter_layer =
-        Targets::from_str(std::env::var("RUST_LOG").as_deref().unwrap_or("info")).unwrap();
+        Targets::from_str(std::env::var("RUST_LOG").as_deref().unwrap_or("debug")).unwrap();
     let format_layer = tracing_subscriber::fmt::layer();
     tracing_subscriber::registry()
         .with(filter_layer)
@@ -140,10 +141,11 @@ async fn run_target(
     let cookie = format!("SESSDATA={}", bili.sess_data);
 
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(target.interval_sec)).await;
+        let mut resent_entries = Vec::new();
 
+        let mut it = db.iter();
         // 首先尝试重发在数据库中但是并未发出过的消息
-        while let Some(Ok((k, v))) = db.iter().next() {
+        while let Some(Ok((k, v))) = it.next() {
             let dynamic_id: i64 = serde_json::from_slice(&k).unwrap();
             let mut entry: DbEntry = serde_json::from_slice(&v).unwrap();
 
@@ -158,13 +160,18 @@ async fn run_target(
                         entry.sent = true;
 
                         let v = serde_json::to_vec(&entry).unwrap();
-                        db.insert(k, v).unwrap();
+
+                        resent_entries.push((k, v));
                     }
                     Err(e) => {
                         error!("重发错过的动态失败: {}", e);
                     }
                 }
             }
+        }
+
+        for (k, v) in resent_entries {
+            db.insert(k, v)?;
         }
 
         // 获取新动态并发送
@@ -209,7 +216,7 @@ async fn run_target(
 
             let dynamic_key = serde_json::to_vec(&dynamic_id).unwrap();
             if db.contains_key(&dynamic_key)? {
-                trace!("跳过已经收录过的动态 {}", dynamic_id);
+                debug!("跳过已经收录过的动态 {}", dynamic_id);
                 continue;
             }
 
@@ -237,6 +244,8 @@ async fn run_target(
                 }
             }
         }
+
+        tokio::time::sleep(Duration::from_secs(target.interval_sec)).await;
     }
 }
 
