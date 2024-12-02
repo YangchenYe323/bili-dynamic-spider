@@ -1,3 +1,6 @@
+[db]
+path = "spider.db"
+
 [mirai]
 http_url = "http://localhost:7827"
 verify_key = "INITKEYLunaRyu"

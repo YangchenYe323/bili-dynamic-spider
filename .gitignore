@@ -6,4 +6,8 @@
 # Actual config
 spider.toml
 
+# Debug output
 *.out
+
+# DB files
+*.db

@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
@@ -6,9 +6,15 @@ use tokio::fs;
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
 pub struct Config {
+    pub db: DbConfig,
     pub mirai: MiraiConfig,
     pub bili: BiliConfig,
     pub target: Vec<TargetConfig>,
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct DbConfig {
+    pub path: PathBuf,
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]

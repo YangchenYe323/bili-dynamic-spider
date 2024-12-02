@@ -10,6 +10,10 @@
 2. 在本项目根目录下创建`spider.toml`, 配置文件内容参考 [spider.toml.example](spider.toml.example)
 
 ```Toml
+# 存储本地数据
+[db]
+path = "spider.db"
+
 # mirai-http-api配置
 [mirai]
 http_url = "http://localhost:7827"

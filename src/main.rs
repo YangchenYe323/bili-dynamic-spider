@@ -16,12 +16,15 @@ use image::{
     imageops::{self, FilterType},
     ImageReader, Rgba, RgbaImage,
 };
+use jiff::tz::Offset;
 use lazy_static::lazy_static;
 use painter::{create_circular_image, draw_content_image, PicGenerator};
-use reqwest::IntoUrl;
+use reqwest::{Client, IntoUrl};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::{debug, error, info};
+use sled::Tree;
+use tokio::task::JoinSet;
+use tracing::{debug, error, info, trace, warn};
 use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::SubscriberInitExt};
 
 const TEXT_SCALE: PxScale = uniform_scale(30.0);
@@ -36,6 +39,7 @@ const fn uniform_scale(s: f32) -> PxScale {
 pub struct Resource {
     pub text_normal_font: FontArc,
     pub emoji_font: FontArc,
+    pub no_face_image: RgbaImage,
     pub vip_image: RgbaImage,
     pub web_image: RgbaImage,
     pub bv_image: RgbaImage,
@@ -71,6 +75,15 @@ enum RichTextNode {
     Goods,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DbEntry {
+    // 当前动态是否发送过
+    sent: bool,
+    // 当前动态类型(`https://github.com/SocialSisterYi/bilibili-API-collect/blob/master/docs/dynamic/card_info.md`)
+    #[serde(rename = "type")]
+    type_: i32,
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // set log collector
@@ -85,6 +98,7 @@ async fn main() -> anyhow::Result<()> {
     info!("tracing配置完成, 从spider.toml中读取爬虫配置");
 
     let Config {
+        db: db_config,
         mirai,
         bili,
         target,
@@ -92,20 +106,26 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("Get config for spider")?;
 
-    let mut handles = Vec::new();
+    let db = sled::open(db_config.path)?;
+
+    let mut target_set = JoinSet::new();
 
     for t in target {
+        let tree = db.open_tree(format!("{}", t.uid))?;
         let m = mirai.clone();
         let b = bili.clone();
-        handles.push(tokio::spawn(run_target(m, b, t)));
+        target_set.spawn(run_target(tree, m, b, t));
     }
 
-    futures::future::join_all(handles.into_iter()).await;
+    while let Some(res) = target_set.join_next().await {
+        res??;
+    }
 
     Ok(())
 }
 
 async fn run_target(
+    db: Tree,
     mirai: MiraiConfig,
     bili: BiliConfig,
     target: TargetConfig,
@@ -115,63 +135,39 @@ async fn run_target(
         target.uid, target.receiver_qq
     );
 
-    info!(
-        "开始获取MIRAI HTTP会话并绑定发送者QQ号 {}",
-        target.sender_qq
-    );
-
-    let tz = jiff::tz::TimeZone::get("Asia/Chongqing").unwrap();
-
     let client = reqwest::Client::new();
-
-    let verify_request = VerifyRequest {
-        verify_key: mirai.verify_key.clone(),
-    };
-
-    let verify_response: VerifyResponse = client
-        .post(format!("{}/verify", mirai.http_url))
-        .json(&verify_request)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    let session_key = verify_response.session;
-
-    let bind_request = BindRequest {
-        session_key: session_key.clone(),
-        qq: target.sender_qq,
-    };
-
-    let bind_response: BindResponse = client
-        .post(format!("{}/bind", mirai.http_url))
-        .json(&bind_request)
-        .send()
-        .await?
-        .json()
-        .await?;
-
-    assert_eq!(
-        0, bind_response.code,
-        "绑定发送者QQ失败: {}",
-        bind_response.msg
-    );
-
-    info!("成功获取MIRAI会话并绑定发送者QQ");
-
-    let mut last_ts = jiff::Timestamp::now();
-
-    info!(
-        "开始监听UID {} 自 {} 之后的动态消息",
-        target.uid,
-        print_ts(last_ts, tz.clone()),
-    );
 
     let cookie = format!("SESSDATA={}", bili.sess_data);
 
     loop {
         tokio::time::sleep(tokio::time::Duration::from_secs(target.interval_sec)).await;
 
+        // 首先尝试重发在数据库中但是并未发出过的消息
+        while let Some(Ok((k, v))) = db.iter().next() {
+            let dynamic_id: i64 = serde_json::from_slice(&k).unwrap();
+            let mut entry: DbEntry = serde_json::from_slice(&v).unwrap();
+
+            if !entry.sent {
+                info!("重发动态 {}", dynamic_id);
+
+                let messages =
+                    create_message_from_dynamic(&bili, &client, entry.type_, dynamic_id).await?;
+
+                match send_qq_message(&mirai, &target, &client, messages).await {
+                    Ok(_) => {
+                        entry.sent = true;
+
+                        let v = serde_json::to_vec(&entry).unwrap();
+                        db.insert(k, v).unwrap();
+                    }
+                    Err(e) => {
+                        error!("重发错过的动态失败: {}", e);
+                    }
+                }
+            }
+        }
+
+        // 获取新动态并发送
         let response: Value = client
             .get("https://api.vc.bilibili.com/dynamic_svr/v1/dynamic_svr/space_history")
             .header("COOKIE", &cookie)
@@ -199,79 +195,58 @@ async fn run_target(
             continue;
         };
 
-        for card in cards.iter().rev() {
+        // 获取三条最新动态, 按照时间戳从小到大排列
+        for card in cards.iter().take(3).rev() {
             let desc = &card["desc"];
             let uname = desc["user_profile"]["info"]["uname"].as_str().unwrap();
 
             let dynamic_id = desc["dynamic_id"].as_i64().unwrap();
-
-            if dynamic_id != 979492889902972978 {
-                continue;
-            }
-
-            let ts = jiff::Timestamp::from_second(desc["timestamp"].as_i64().unwrap()).unwrap();
-
-            if ts <= last_ts {
-                continue;
-            }
-
-            last_ts = ts;
-
             let dynamic_type = desc.get("type").unwrap().as_i64().unwrap();
 
-            match dynamic_type {
-                2 | 4 => {
-                    info!("监听到 {} 新动态 {}", uname, dynamic_id);
+            if dynamic_type != 2 && dynamic_type != 4 {
+                debug!("跳过不支持的动态类型 {} ({})", dynamic_id, dynamic_type);
+            }
 
-                    // 构建动态内容图片
-                    let mut generator = PicGenerator::new(740, 10000);
+            let dynamic_key = serde_json::to_vec(&dynamic_id).unwrap();
+            if db.contains_key(&dynamic_key)? {
+                trace!("跳过已经收录过的动态 {}", dynamic_id);
+                continue;
+            }
 
-                    generator.draw_rectangle(0, 0, 10000, 740, WHITE);
+            let mut entry = DbEntry {
+                sent: false,
+                type_: dynamic_type as i32,
+            };
 
-                    // TODO: what if user has no face?
-                    let face = desc["user_profile"]["info"]["face"].as_str().unwrap();
-                    let face_image = download_image(face).await?;
-                    let vip = desc["user_profile"]["vip"]["nickname_color"]
-                        .as_str()
-                        .unwrap()
-                        != "";
-                    let ts_str = print_ts(ts, tz.clone());
+            db.insert(&dynamic_key, serde_json::to_vec(&entry).unwrap())?;
 
-                    // 绘制用户头像 (100 x 100放在圆形框框内)
-                    let resized_face =
-                        imageops::resize(&face_image, 100, 100, FilterType::Lanczos3);
-                    let circular_face = create_circular_image(&resized_face, 100);
-                    generator.draw_img_alpha(&circular_face, Some((50, 50)));
-                    // 绘制大会员下标
-                    if vip {
-                        generator.draw_img_alpha(&RESOURCE.vip_image, Some((118, 118)));
-                    }
+            info!("监听到 {} 新动态 {}", uname, dynamic_id);
 
-                    generator.set_pos(175, 60);
+            let messages =
+                create_message_from_dynamic(&bili, &client, dynamic_type as i32, dynamic_id)
+                    .await?;
 
-                    let uname_color = if vip { PINK } else { BLACK };
+            match send_qq_message(&mirai, &target, &client, messages).await {
+                Ok(_) => {
+                    entry.sent = true;
+                    db.insert(&dynamic_key, serde_json::to_vec(&entry).unwrap())
+                        .unwrap();
+                }
+                Err(e) => {
+                    error!("发送qq消息失败: {}", e);
+                }
+            }
+        }
+    }
+}
 
-                    // 绘制用户名和动态时间戳
-                    generator.draw_text(
-                        &[uname],
-                        &[uname_color],
-                        &RESOURCE.text_normal_font,
-                        TEXT_SCALE,
-                        None,
-                    );
-                    generator.draw_text(
-                        &[&ts_str],
-                        &[GRAY],
-                        &RESOURCE.text_normal_font,
-                        TIP_SCALE,
-                        None,
-                    );
-
-                    generator.set_x(25);
-                    generator.set_row_space(10);
-
-                    // 获取动态内容
-                    let get_detail_response: Value =  client
+async fn create_message_from_dynamic(
+    bili: &BiliConfig,
+    client: &Client,
+    dynamic_type: i32,
+    dynamic_id: i64,
+) -> anyhow::Result<Vec<Message>> {
+    let detail_response: Value =  client
                         .get(format!("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id={}&features=itemOpusStyle,opusBigCover,onlyfansVote", dynamic_id))
                         .header("COOKIE", format!("SESSDATA={}", bili.sess_data))
                         .send()
@@ -281,146 +256,262 @@ async fn run_target(
                         .await
                         .unwrap();
 
-                    let opus = &get_detail_response["data"]["item"]["modules"]["module_dynamic"]
-                        ["major"]["opus"];
+    let author_info = &detail_response["data"]["item"]["modules"]["module_author"];
+    let dynamic_opus =
+        &detail_response["data"]["item"]["modules"]["module_dynamic"]["major"]["opus"];
 
-                    let title = opus
-                        .get("title")
-                        .and_then(Value::as_str)
-                        .map(str::to_string);
-                    let raw_text_nodes = opus
-                        .get("summary")
-                        .and_then(|summary| summary.get("rich_text_nodes"))
-                        .and_then(Value::as_array);
+    // 构建动态内容图片
+    let mut generator = PicGenerator::new(740, 10000);
 
-                    let rich_text_nodes = if let Some(raw_text_nodes) = raw_text_nodes {
-                        build_text_nodes(title, raw_text_nodes)
-                    } else {
-                        build_text_nodes(title, &[])
+    generator.draw_rectangle(0, 0, 10000, 740, WHITE);
+
+    let face_url = author_info.get("face").and_then(Value::as_str);
+    let face_image = if let Some(face_url) = face_url {
+        download_image(face_url).await?
+    } else {
+        RESOURCE.no_face_image.clone()
+    };
+
+    let uname = author_info["name"].as_str().unwrap();
+
+    let vip = author_info
+        .get("vip")
+        .and_then(|v| v.get("nickname_color"))
+        .and_then(|c| c.as_str())
+        .map(|s| !s.is_empty())
+        .unwrap_or_default();
+
+    let timestamp = author_info
+        .get("pub_ts")
+        .and_then(|v| v.as_i64())
+        .and_then(|ts| {
+            // Asia/Chongqing
+            let tz = jiff::tz::TimeZone::fixed(Offset::constant(8));
+            let ts = jiff::Timestamp::from_second(ts).ok()?;
+            let zoned_ts = ts.to_zoned(tz);
+            jiff::fmt::strtime::format("%Y-%m-%d %H:%M", &zoned_ts).ok()
+        })
+        .unwrap_or_default();
+
+    // 绘制用户头像 (100 x 100放在圆形框框内)
+    let resized_face = imageops::resize(&face_image, 100, 100, FilterType::Lanczos3);
+    let circular_face = create_circular_image(&resized_face, 100);
+    generator.draw_img_alpha(&circular_face, Some((50, 50)));
+    // 绘制大会员下标
+    if vip {
+        generator.draw_img_alpha(&RESOURCE.vip_image, Some((118, 118)));
+    }
+
+    generator.set_pos(175, 60);
+
+    let uname_color = if vip { PINK } else { BLACK };
+
+    // 绘制用户名和动态时间戳
+    generator.draw_text(
+        &[uname],
+        &[uname_color],
+        &RESOURCE.text_normal_font,
+        TEXT_SCALE,
+        None,
+    );
+    generator.draw_text(
+        &[&timestamp],
+        &[GRAY],
+        &RESOURCE.text_normal_font,
+        TIP_SCALE,
+        None,
+    );
+
+    generator.set_x(25);
+    generator.set_row_space(10);
+
+    let title = dynamic_opus
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let raw_text_nodes = dynamic_opus
+        .get("summary")
+        .and_then(|summary| summary.get("rich_text_nodes"))
+        .and_then(Value::as_array);
+
+    let rich_text_nodes = if let Some(raw_text_nodes) = raw_text_nodes {
+        build_text_nodes(title, raw_text_nodes)
+    } else {
+        build_text_nodes(title, &[])
+    }
+    .await?;
+
+    // 绘制动态内容
+    let content_images = draw_content_image(
+        &rich_text_nodes,
+        generator.width() - 50,
+        &RESOURCE.text_normal_font,
+        &RESOURCE.emoji_font,
+        TEXT_SCALE,
+        EMOJI_SCALE,
+        &RESOURCE.web_image,
+        &RESOURCE.bv_image,
+        &RESOURCE.lottery_image,
+        &RESOURCE.vote_image,
+        &RESOURCE.goods_image,
+    );
+
+    for img in content_images {
+        generator.draw_img_alpha(&img, None);
+    }
+
+    generator.set_x(10);
+
+    if dynamic_type == 2 {
+        if let Some(pictures) = dynamic_opus.get("pics").and_then(Value::as_array) {
+            let images = download_dynamic_images(pictures, generator.width(), 10).await?;
+
+            let num_pics_per_line = match images.len() {
+                1 => 1,
+                2 | 4 => 2,
+                _ => 3,
+            };
+
+            let image_lines: Vec<&[RgbaImage]> = images.chunks(num_pics_per_line).collect();
+
+            let (mut x, mut y) = (generator.x(), generator.y());
+
+            for line in image_lines {
+                for (i, img) in line.iter().enumerate() {
+                    generator.draw_img(img, Some((x, y)));
+
+                    x += img.width() + 10;
+                    generator.set_x(x);
+
+                    if i == line.len() - 1 {
+                        y += img.height() + 10;
+                        generator.set_y(y);
+                        x = 10;
+                        generator.set_x(x);
                     }
-                    .await?;
-
-                    // 绘制动态内容
-                    let content_images = draw_content_image(
-                        &rich_text_nodes,
-                        generator.width() - 50,
-                        &RESOURCE.text_normal_font,
-                        &RESOURCE.emoji_font,
-                        TEXT_SCALE,
-                        EMOJI_SCALE,
-                        &RESOURCE.web_image,
-                        &RESOURCE.bv_image,
-                        &RESOURCE.lottery_image,
-                        &RESOURCE.vote_image,
-                        &RESOURCE.goods_image,
-                    );
-
-                    for img in content_images {
-                        generator.draw_img_alpha(&img, None);
-                    }
-
-                    generator.set_x(10);
-
-                    if dynamic_type == 2 {
-                        let card: Value = serde_json::from_str(card["card"].as_str().unwrap())?;
-                        // 获取动态图片
-                        let pictures = &card["item"]["pictures"];
-
-                        let images =
-                            download_dynamic_images(pictures, generator.width(), 10).await?;
-
-                        let num_pics_per_line = match images.len() {
-                            1 => 1,
-                            2 | 4 => 2,
-                            _ => 3,
-                        };
-
-                        let image_lines: Vec<&[RgbaImage]> =
-                            images.chunks(num_pics_per_line).collect();
-
-                        let (mut x, mut y) = (generator.x(), generator.y());
-
-                        for line in image_lines {
-                            for (i, img) in line.iter().enumerate() {
-                                generator.draw_img(img, Some((x, y)));
-
-                                x += img.width() + 10;
-                                generator.set_x(x);
-
-                                if i == line.len() - 1 {
-                                    y += img.height() + 10;
-                                    generator.set_y(y);
-                                    x = 10;
-                                    generator.set_x(x);
-                                }
-                            }
-                        }
-
-                        // bottom margin
-                        generator.set_y(y + 20);
-                    }
-
-                    generator.crop_bottom();
-
-                    let image = generator.into_image();
-
-                    let mut png_buffer = Vec::new();
-                    let mut cursor = Cursor::new(&mut png_buffer);
-                    image.write_to(&mut cursor, image::ImageFormat::Png)?;
-                    let image_b64 = base64::engine::general_purpose::STANDARD.encode(&png_buffer);
-
-                    // 构造QQ消息链
-                    let mut messages = Vec::new();
-
-                    messages.push(Message::Plain {
-                        text: format!(
-                            "{} 发表了新动态:\n\nhttps://t.bilibili.com/{}\n\n",
-                            uname, dynamic_id,
-                        ),
-                    });
-
-                    messages.push(Message::Image { base64: image_b64 });
-
-                    info!("发送QQ消息");
-
-                    let send_request = SendFriendMessageRequest {
-                        session_key: session_key.clone(),
-                        target: target.receiver_qq,
-                        message_chain: messages,
-                    };
-
-                    let send_response: SendFriendMessageResponse = client
-                        .post(format!("{}/sendFriendMessage", mirai.http_url))
-                        .json(&send_request)
-                        .send()
-                        .await
-                        .context("Request MIRAI /sendFriendMessage")?
-                        .json()
-                        .await?;
-
-                    if send_response.code != 0 {
-                        error!(
-                            "发送qq消息失败: {}: {}",
-                            send_response.code, send_response.msg
-                        );
-                    }
-                }
-
-                x => {
-                    debug!("跳过不支持的动态类型: {}", x);
                 }
             }
-        }
 
-        // Refresh session to keep it alive
-        let _ = client
-            .get(format!("{}/sessionInfo", mirai.http_url))
-            .query(&[("sessionKey", &session_key)])
-            .send()
-            .await?
-            .bytes()
-            .await?;
+            // bottom margin
+            generator.set_y(y + 20);
+        } else {
+            warn!(
+                "没有找到图片动态的图片定义，请检查可能的API变动，动态详细内容: {}",
+                detail_response
+            );
+        }
     }
+
+    generator.crop_bottom();
+
+    let image = generator.into_image();
+
+    let mut png_buffer = Vec::new();
+    let mut cursor = Cursor::new(&mut png_buffer);
+    image.write_to(&mut cursor, image::ImageFormat::Png)?;
+    let image_b64 = base64::engine::general_purpose::STANDARD.encode(&png_buffer);
+
+    // 构造QQ消息链
+    let mut messages = Vec::new();
+
+    messages.push(Message::Plain {
+        text: format!(
+            "{} 发表了新动态:\n\nhttps://t.bilibili.com/{}\n\n",
+            uname, dynamic_id,
+        ),
+    });
+
+    messages.push(Message::Image { base64: image_b64 });
+
+    Ok(messages)
+}
+
+async fn send_qq_message(
+    mirai: &MiraiConfig,
+    target: &TargetConfig,
+    client: &Client,
+    messages: Vec<Message>,
+) -> anyhow::Result<()> {
+    let verify_request = VerifyRequest {
+        verify_key: mirai.verify_key.clone(),
+    };
+
+    let verify_response: VerifyResponse = client
+        .post(format!("{}/verify", mirai.http_url))
+        .json(&verify_request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if verify_response.code != 0 {
+        return Err(anyhow!(
+            "{}: {}",
+            verify_response.code,
+            verify_response.msg.unwrap()
+        ));
+    }
+
+    let session_key = verify_response.session.unwrap();
+
+    let bind_request = BindRequest {
+        session_key: session_key.clone(),
+        qq: target.sender_qq,
+    };
+
+    let bind_response: BindResponse = client
+        .post(format!("{}/bind", mirai.http_url))
+        .json(&bind_request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if bind_response.code != 0 {
+        return Err(anyhow!("{}: {}", bind_response.code, bind_response.msg));
+    }
+
+    let send_request = SendFriendMessageRequest {
+        session_key: session_key.clone(),
+        target: target.receiver_qq,
+        message_chain: messages,
+    };
+
+    let send_response: SendFriendMessageResponse = client
+        .post(format!("{}/sendFriendMessage", mirai.http_url))
+        .json(&send_request)
+        .send()
+        .await
+        .context("Request MIRAI /sendFriendMessage")?
+        .json()
+        .await?;
+
+    if send_response.code != 0 {
+        return Err(anyhow!("{}: {}", send_response.code, send_response.msg));
+    }
+
+    let release_request = ReleaseRequest {
+        session_key: session_key.clone(),
+        qq: target.sender_qq,
+    };
+
+    let release_response: ReleaseResponse = client
+        .post(format!("{}/release", mirai.http_url))
+        .json(&release_request)
+        .send()
+        .await?
+        .json()
+        .await?;
+
+    if release_response.code != 0 {
+        return Err(anyhow!(
+            "{}: {}",
+            release_response.code,
+            release_response.msg
+        ));
+    }
+
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -433,7 +524,8 @@ struct VerifyRequest {
 
 struct VerifyResponse {
     code: i32,
-    session: String,
+    msg: Option<String>,     // When fail
+    session: Option<String>, // When success
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -509,7 +601,7 @@ async fn test_send_qq() {
 
     assert_eq!(0, verify_response.code, "verify failed");
 
-    let session_key = verify_response.session;
+    let session_key = verify_response.session.unwrap();
 
     println!("Got session key: {}", session_key);
 
@@ -578,15 +670,10 @@ async fn test_send_qq() {
     println!("released session key {}", session_key);
 }
 
-fn print_ts(ts: jiff::Timestamp, tz: jiff::tz::TimeZone) -> String {
-    let zoned = ts.to_zoned(tz);
-
-    jiff::fmt::strtime::format("%Y-%m-%d %H:%M", &zoned).unwrap()
-}
-
 fn load_resource(dir: impl AsRef<Path>) -> anyhow::Result<Resource> {
     let text_normal_font = load_font_from_file(dir.as_ref().join("normal.ttf"))?;
     let emoji_font = load_font_from_file(dir.as_ref().join("emoji.ttf"))?;
+    let no_face_image = load_image_from_file(dir.as_ref().join("face.png"))?;
     let web_image = load_image_from_file(dir.as_ref().join("link.png"))?;
     let bv_image = load_image_from_file(dir.as_ref().join("video.png"))?;
     let lottery_image = load_image_from_file(dir.as_ref().join("box.png"))?;
@@ -597,6 +684,7 @@ fn load_resource(dir: impl AsRef<Path>) -> anyhow::Result<Resource> {
     Ok(Resource {
         text_normal_font,
         emoji_font,
+        no_face_image,
         vip_image,
         web_image,
         bv_image,
@@ -698,12 +786,10 @@ async fn download_emoji(emoji_node: &Value) -> anyhow::Result<RgbaImage> {
 }
 
 pub async fn download_dynamic_images(
-    pictures: &Value,
+    pictures: &[Value],
     image_area_width: u32,
     image_margin: u32,
 ) -> anyhow::Result<Vec<RgbaImage>> {
-    let pictures = pictures.as_array().unwrap();
-
     let num_pictures = pictures.len();
 
     // - 1 picture -> Just show one
@@ -718,9 +804,17 @@ pub async fn download_dynamic_images(
     // https://github.com/Starlwr/StarBot/blob/f92b4d71366e19046f5c1ae87fe85f2f2461cd69/starbot/painter/DynamicPicGenerator.py#L452-L469
     let mut set = Vec::with_capacity(pictures.len());
     for pic in pictures {
-        let src = pic["img_src"].as_str().unwrap().to_string();
-        let height = pic["img_height"].as_f64().unwrap();
-        let width = pic["img_width"].as_f64().unwrap();
+        let (src, height, width) = match (
+            pic.get("url").and_then(Value::as_str).map(str::to_string),
+            pic.get("height").and_then(Value::as_f64),
+            pic.get("width").and_then(Value::as_f64),
+        ) {
+            (Some(src), Some(height), Some(width)) => (src, height, width),
+            _ => {
+                warn!("不合法的图片定义: {}，请检查API变动", pic);
+                continue;
+            }
+        };
 
         if num_pictures_in_line == 1 {
             set.push(download_image(format!("{}@518w.webp", src)));
