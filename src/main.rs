@@ -1,15 +1,15 @@
 mod config;
 mod painter;
+mod resource;
 
 use std::{
     cmp,
     io::{BufReader, Cursor},
-    path::Path,
     str::FromStr,
     time::Duration,
 };
 
-use ab_glyph::{FontArc, PxScale};
+use ab_glyph::PxScale;
 use anyhow::{anyhow, Context};
 use base64::Engine;
 use config::{get_config_from_file, BiliConfig, Config, MiraiConfig, TargetConfig};
@@ -18,9 +18,9 @@ use image::{
     ImageReader, Rgba, RgbaImage,
 };
 use jiff::tz::Offset;
-use lazy_static::lazy_static;
 use painter::{create_circular_image, draw_content_image, PicGenerator};
 use reqwest::{Client, IntoUrl};
+use resource::RESOURCE;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sled::Tree;
@@ -30,27 +30,10 @@ use tracing_subscriber::{filter::Targets, layer::SubscriberExt, util::Subscriber
 
 const TEXT_SCALE: PxScale = uniform_scale(30.0);
 const TIP_SCALE: PxScale = uniform_scale(25.0);
-const EMOJI_SCALE: PxScale = uniform_scale(109.0);
+const EMOJI_SCALE: PxScale = uniform_scale(25.0);
 
 const fn uniform_scale(s: f32) -> PxScale {
     PxScale { x: s, y: s }
-}
-
-#[derive(Debug)]
-pub struct Resource {
-    pub text_normal_font: FontArc,
-    pub emoji_font: FontArc,
-    pub no_face_image: RgbaImage,
-    pub vip_image: RgbaImage,
-    pub web_image: RgbaImage,
-    pub bv_image: RgbaImage,
-    pub lottery_image: RgbaImage,
-    pub vote_image: RgbaImage,
-    pub goods_image: RgbaImage,
-}
-
-lazy_static! {
-    static ref RESOURCE: Resource = load_resource("./resource").expect("加载资源失败");
 }
 
 const WHITE: Rgba<u8> = Rgba::<u8>([255, 255, 255, 255]);
@@ -354,15 +337,9 @@ async fn create_message_from_dynamic(
     let content_images = draw_content_image(
         &rich_text_nodes,
         generator.width() - 50,
-        &RESOURCE.text_normal_font,
-        &RESOURCE.emoji_font,
         TEXT_SCALE,
         EMOJI_SCALE,
-        &RESOURCE.web_image,
-        &RESOURCE.bv_image,
-        &RESOURCE.lottery_image,
-        &RESOURCE.vote_image,
-        &RESOURCE.goods_image,
+        &RESOURCE,
     );
 
     for img in content_images {
@@ -677,42 +654,6 @@ async fn test_send_qq() {
     );
 
     println!("released session key {}", session_key);
-}
-
-fn load_resource(dir: impl AsRef<Path>) -> anyhow::Result<Resource> {
-    let text_normal_font = load_font_from_file(dir.as_ref().join("normal.ttf"))?;
-    let emoji_font = load_font_from_file(dir.as_ref().join("emoji.ttf"))?;
-    let no_face_image = load_image_from_file(dir.as_ref().join("face.png"))?;
-    let web_image = load_image_from_file(dir.as_ref().join("link.png"))?;
-    let bv_image = load_image_from_file(dir.as_ref().join("video.png"))?;
-    let lottery_image = load_image_from_file(dir.as_ref().join("box.png"))?;
-    let vote_image = load_image_from_file(dir.as_ref().join("tick.png"))?;
-    let goods_image = load_image_from_file(dir.as_ref().join("tb.png"))?;
-    let vip_image = load_image_from_file(dir.as_ref().join("vip.png"))?;
-
-    Ok(Resource {
-        text_normal_font,
-        emoji_font,
-        no_face_image,
-        vip_image,
-        web_image,
-        bv_image,
-        lottery_image,
-        vote_image,
-        goods_image,
-    })
-}
-
-fn load_font_from_file(path: impl AsRef<Path>) -> anyhow::Result<FontArc> {
-    let bytes = std::fs::read(path)?;
-    Ok(FontArc::try_from_vec(bytes)?)
-}
-
-fn load_image_from_file(path: impl AsRef<Path>) -> anyhow::Result<RgbaImage> {
-    Ok(ImageReader::open(path)?
-        .with_guessed_format()?
-        .decode()?
-        .into_rgba8())
 }
 
 async fn download_image(url: impl IntoUrl) -> anyhow::Result<RgbaImage> {

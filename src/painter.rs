@@ -1,15 +1,20 @@
 //! Inspired by https://github.com/Starlwr/StarBot/blob/master/starbot/painter/PicGenerator.py
 
-use std::path::Path;
+use std::{
+    io::{BufReader, Cursor},
+    path::Path,
+};
 
-use ab_glyph::{Font, PxScale};
+use ab_glyph::{v2::GlyphImage, Font, GlyphImageFormat, PxScale};
+use anyhow::{anyhow, Result};
 use image::{
-    imageops::{self},
-    Rgba, RgbaImage,
+    imageops::{self, FilterType},
+    ImageFormat, ImageReader, Rgba, RgbaImage,
 };
 use imageproc::definitions::HasBlack;
+use tracing::debug;
 
-use crate::RichTextNode;
+use crate::{resource::Resource, RichTextNode};
 
 pub struct PicGenerator {
     /// image buffer
@@ -234,18 +239,12 @@ pub fn create_circular_image(input_image: &RgbaImage, diameter: u32) -> RgbaImag
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn draw_content_image<F: Font>(
+pub fn draw_content_image(
     nodes: &[RichTextNode],
     line_max_width: u32,
-    text_normal_font: &F,
-    emoji_font: &F,
     text_scale: PxScale,
     emoji_scale: PxScale,
-    web_image: &RgbaImage,
-    bv_image: &RgbaImage,
-    lottery_image: &RgbaImage,
-    vote_image: &RgbaImage,
-    goods_image: &RgbaImage,
+    resource: &Resource,
 ) -> Vec<RgbaImage> {
     let mut images = Vec::new();
 
@@ -268,32 +267,58 @@ pub fn draw_content_image<F: Font>(
 
                 let s = c.to_string();
 
-                let (scale, font) = if is_emoji(c) {
-                    (emoji_scale, &emoji_font)
+                let cwidth = if is_emoji(c) {
+                    let id = resource.emoji_font.glyph_id(c);
+
+                    let image = match resource.emoji_font.glyph_raster_image2(id, u16::MAX) {
+                        Some(glyph_image) => match glyph_to_rgba(&glyph_image) {
+                            Ok(image) => image,
+                            Err(e) => {
+                                debug!("emoji {} 无法从字体图片创建RGBA图片，跳过...: {}", c, e);
+                                continue;
+                            }
+                        },
+                        None => {
+                            debug!("字体无法找到emoji {} 的字体图片，跳过...", c);
+                            continue;
+                        }
+                    };
+
+                    let resized_image = imageops::resize(
+                        &image,
+                        emoji_scale.x as u32,
+                        emoji_scale.y as u32,
+                        FilterType::Lanczos3,
+                    );
+
+                    paste_image_with_alpha(&mut current_image, &resized_image, x, y);
+
+                    emoji_scale.x as u32
                 } else {
-                    (text_scale, &text_normal_font)
-                };
+                    let (cwidth, _cheight) =
+                        imageproc::drawing::text_size(text_scale, &resource.text_normal_font, &s);
 
-                let (cwidth, _) = imageproc::drawing::text_size(scale, font, &s);
+                    if x + cwidth > line_max_width {
+                        images.push(std::mem::replace(
+                            &mut current_image,
+                            RgbaImage::new(line_max_width, 40),
+                        ));
+                        x = 0;
+                        y = 0;
+                    }
 
-                if x + cwidth > line_max_width {
-                    images.push(std::mem::replace(
+                    imageproc::drawing::draw_text_mut(
                         &mut current_image,
-                        RgbaImage::new(line_max_width, 40),
-                    ));
-                    x = 0;
-                    y = 0;
-                }
+                        Rgba::<u8>::black(),
+                        x as i32,
+                        y as i32,
+                        text_scale,
+                        &resource.text_normal_font,
+                        &s,
+                    );
 
-                imageproc::drawing::draw_text_mut(
-                    &mut current_image,
-                    Rgba::<u8>::black(),
-                    x as i32,
-                    y as i32,
-                    scale,
-                    font,
-                    &s,
-                );
+                    cwidth
+                };
 
                 x += cwidth;
             }
@@ -303,11 +328,11 @@ pub fn draw_content_image<F: Font>(
 
         let image_to_draw = match node {
             RichTextNode::Emoji { img } => img,
-            RichTextNode::Web => web_image,
-            RichTextNode::Bv => bv_image,
-            RichTextNode::Lottery => lottery_image,
-            RichTextNode::Vote => vote_image,
-            RichTextNode::Goods => goods_image,
+            RichTextNode::Web => &resource.web_image,
+            RichTextNode::Bv => &resource.bv_image,
+            RichTextNode::Lottery => &resource.lottery_image,
+            RichTextNode::Vote => &resource.vote_image,
+            RichTextNode::Goods => &resource.goods_image,
             _ => unreachable!(),
         };
 
@@ -334,6 +359,22 @@ pub fn draw_content_image<F: Font>(
     images.push(current_image);
 
     images
+}
+
+fn glyph_to_rgba(glyph_image: &GlyphImage<'_>) -> Result<RgbaImage> {
+    if !matches!(glyph_image.format, GlyphImageFormat::Png) {
+        return Err(anyhow!(
+            "Unsupported glyph image type: {:?}",
+            glyph_image.format
+        ));
+    }
+
+    let mut reader = ImageReader::new(BufReader::new(Cursor::new(&glyph_image.data)));
+    reader.set_format(ImageFormat::Png);
+
+    let image = reader.decode()?;
+
+    Ok(image.to_rgba8())
 }
 
 // Paste an overlay image onto the base image starting at (x, y) of the base image
@@ -431,6 +472,8 @@ fn is_emoji(character: char) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use crate::WHITE;
+
     use super::*;
     use image::ImageReader;
 
@@ -454,7 +497,7 @@ mod tests {
         paste_image(&mut base_img, &rgba_img, 0, h);
         paste_image(&mut base_img, &rgba_img, w, h);
 
-        base_img.save("test_resources/combined_image.png").unwrap();
+        base_img.save("test_data/combined_image.png").unwrap();
     }
 
     #[test]
@@ -476,7 +519,27 @@ mod tests {
 
         paste_image_with_alpha(&mut base, &overlay, x, y);
 
-        base.save("test_resources/combined_image_alpha.png")
-            .unwrap();
+        base.save("test_data/combined_image_alpha.png").unwrap();
+    }
+
+    #[test]
+    fn test_gen_emoji() {
+        let node = vec![RichTextNode::Text {
+            text: "你是脑残吗😀🥰👿💩😡🥰😸".to_string(),
+        }];
+
+        let res = Resource::load_from_dir("./resource").unwrap();
+
+        let images = draw_content_image(&node, 1000, 40.0.into(), 35.0.into(), &res);
+
+        let mut gen = PicGenerator::new(1000, 1000);
+
+        gen.draw_rectangle(0, 0, 1000, 1000, WHITE);
+
+        for i in images {
+            gen.draw_img(&i, None);
+        }
+
+        gen.save("test_data/emoji.png").unwrap();
     }
 }
