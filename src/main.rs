@@ -17,7 +17,11 @@ use image::{
     imageops::{self, FilterType},
     ImageReader, Rgba, RgbaImage,
 };
-use jiff::tz::Offset;
+use jiff::{
+    fmt::strtime,
+    tz::{Offset, TimeZone},
+    Timestamp,
+};
 use painter::{create_circular_image, draw_content_image, PicGenerator};
 use reqwest::{Client, IntoUrl};
 use resource::RESOURCE;
@@ -39,7 +43,13 @@ const fn uniform_scale(s: f32) -> PxScale {
 const WHITE: Rgba<u8> = Rgba::<u8>([255, 255, 255, 255]);
 const BLACK: Rgba<u8> = Rgba::<u8>([0, 0, 0, 255]);
 const GRAY: Rgba<u8> = Rgba::<u8>([169, 169, 169, 255]);
+const LIGHT_GRAY: Rgba<u8> = Rgba::<u8>([244, 244, 244, 255]);
 const PINK: Rgba<u8> = Rgba::<u8>([251, 114, 153, 255]);
+const DEEP_BLUE: Rgba<u8> = Rgba::<u8>([175, 238, 238, 255]);
+
+const DYNAMIC_TYPE_DRAW: &str = "DYNAMIC_TYPE_DRAW"; // 带图动态
+const DYNAMIC_TYPE_FORWARD: &str = "DYNAMIC_TYPE_FORWARD"; //转发动态
+const DYNAMIC_TYPE_WORD: &str = "DYNAMIC_TYPE_WORD"; // 纯文字动态
 
 #[derive(Debug)]
 enum RichTextNode {
@@ -72,14 +82,14 @@ struct DbEntry {
 async fn main() -> anyhow::Result<()> {
     // set log collector
     let filter_layer =
-        Targets::from_str(std::env::var("RUST_LOG").as_deref().unwrap_or("debug")).unwrap();
+        Targets::from_str(std::env::var("RUST_LOG").as_deref().unwrap_or("info")).unwrap();
     let format_layer = tracing_subscriber::fmt::layer();
     tracing_subscriber::registry()
         .with(filter_layer)
         .with(format_layer)
         .init();
 
-    info!("tracing配置完成, 从spider.toml中读取爬虫配置");
+    info!("日志配置完成, 从spider.toml中读取爬虫配置");
 
     let Config {
         db: db_config,
@@ -135,8 +145,7 @@ async fn run_target(
             if !entry.sent {
                 info!("重发动态 {}", dynamic_id);
 
-                let messages =
-                    create_message_from_dynamic(&bili, &client, entry.type_, dynamic_id).await?;
+                let messages = create_message_from_dynamic(&bili, &client, dynamic_id).await?;
 
                 match send_qq_message(&mirai, &target, &client, messages).await {
                     Ok(_) => {
@@ -193,8 +202,9 @@ async fn run_target(
             let dynamic_id = desc["dynamic_id"].as_i64().unwrap();
             let dynamic_type = desc.get("type").unwrap().as_i64().unwrap();
 
-            if dynamic_type != 2 && dynamic_type != 4 {
+            if dynamic_type != 2 && dynamic_type != 4 && dynamic_type != 1 {
                 debug!("跳过不支持的动态类型 {} ({})", dynamic_id, dynamic_type);
+                continue;
             }
 
             let dynamic_key = serde_json::to_vec(&dynamic_id).unwrap();
@@ -212,18 +222,19 @@ async fn run_target(
 
             info!("监听到 {} 新动态 {}", uname, dynamic_id);
 
-            let messages =
-                create_message_from_dynamic(&bili, &client, dynamic_type as i32, dynamic_id)
-                    .await?;
-
-            match send_qq_message(&mirai, &target, &client, messages).await {
-                Ok(_) => {
-                    entry.sent = true;
-                    db.insert(&dynamic_key, serde_json::to_vec(&entry).unwrap())
-                        .unwrap();
-                }
+            match create_message_from_dynamic(&bili, &client, dynamic_id).await {
+                Ok(messages) => match send_qq_message(&mirai, &target, &client, messages).await {
+                    Ok(_) => {
+                        entry.sent = true;
+                        db.insert(&dynamic_key, serde_json::to_vec(&entry).unwrap())
+                            .unwrap();
+                    }
+                    Err(e) => {
+                        error!("发送qq消息失败: {}", e);
+                    }
+                },
                 Err(e) => {
-                    error!("发送qq消息失败: {}", e);
+                    error!("{}", e)
                 }
             }
         }
@@ -235,163 +246,14 @@ async fn run_target(
 async fn create_message_from_dynamic(
     bili: &BiliConfig,
     client: &Client,
-    dynamic_type: i32,
     dynamic_id: i64,
 ) -> anyhow::Result<Vec<Message>> {
-    let detail_response: Value =  client
-                        .get(format!("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id={}&features=itemOpusStyle,opusBigCover,onlyfansVote", dynamic_id))
-                        .header("COOKIE", format!("SESSDATA={}", bili.sess_data))
-                        .send()
-                        .await
-                        .unwrap()
-                        .json()
-                        .await
-                        .unwrap();
+    // 访问网络获取动态数据结构
+    let dynamic = BiliDynamic::fetch(bili, client, dynamic_id).await?;
+    // 画一张动态图
+    let image = draw_dynamic(&dynamic);
 
-    let author_info = &detail_response["data"]["item"]["modules"]["module_author"];
-    let dynamic_opus =
-        &detail_response["data"]["item"]["modules"]["module_dynamic"]["major"]["opus"];
-
-    // 构建动态内容图片
-    let mut generator = PicGenerator::new(740, 10000);
-
-    generator.draw_rectangle(0, 0, 10000, 740, WHITE);
-
-    let face_url = author_info.get("face").and_then(Value::as_str);
-    let face_image = if let Some(face_url) = face_url {
-        download_image(face_url).await?
-    } else {
-        RESOURCE.no_face_image.clone()
-    };
-
-    let uname = author_info["name"].as_str().unwrap();
-
-    let vip = author_info
-        .get("vip")
-        .and_then(|v| v.get("nickname_color"))
-        .and_then(|c| c.as_str())
-        .map(|s| !s.is_empty())
-        .unwrap_or_default();
-
-    let timestamp = author_info
-        .get("pub_ts")
-        .and_then(|v| v.as_i64())
-        .and_then(|ts| {
-            // Asia/Chongqing
-            let tz = jiff::tz::TimeZone::fixed(Offset::constant(8));
-            let ts = jiff::Timestamp::from_second(ts).ok()?;
-            let zoned_ts = ts.to_zoned(tz);
-            jiff::fmt::strtime::format("%Y-%m-%d %H:%M", &zoned_ts).ok()
-        })
-        .unwrap_or_default();
-
-    // 绘制用户头像 (100 x 100放在圆形框框内)
-    let resized_face = imageops::resize(&face_image, 100, 100, FilterType::Lanczos3);
-    let circular_face = create_circular_image(&resized_face, 100);
-    generator.draw_img_alpha(&circular_face, Some((50, 50)));
-    // 绘制大会员下标
-    if vip {
-        generator.draw_img_alpha(&RESOURCE.vip_image, Some((118, 118)));
-    }
-
-    generator.set_pos(175, 60);
-
-    let uname_color = if vip { PINK } else { BLACK };
-
-    // 绘制用户名和动态时间戳
-    generator.draw_text(
-        &[uname],
-        &[uname_color],
-        &RESOURCE.text_normal_font,
-        TEXT_SCALE,
-        None,
-    );
-    generator.draw_text(
-        &[&timestamp],
-        &[GRAY],
-        &RESOURCE.text_normal_font,
-        TIP_SCALE,
-        None,
-    );
-
-    generator.set_x(25);
-    generator.set_row_space(10);
-
-    let title = dynamic_opus
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let raw_text_nodes = dynamic_opus
-        .get("summary")
-        .and_then(|summary| summary.get("rich_text_nodes"))
-        .and_then(Value::as_array);
-
-    let rich_text_nodes = if let Some(raw_text_nodes) = raw_text_nodes {
-        build_text_nodes(title, raw_text_nodes)
-    } else {
-        build_text_nodes(title, &[])
-    }
-    .await?;
-
-    // 绘制动态内容
-    let content_images = draw_content_image(
-        &rich_text_nodes,
-        generator.width() - 50,
-        TEXT_SCALE,
-        EMOJI_SCALE,
-        &RESOURCE,
-    );
-
-    for img in content_images {
-        generator.draw_img_alpha(&img, None);
-    }
-
-    generator.set_x(10);
-
-    if dynamic_type == 2 {
-        if let Some(pictures) = dynamic_opus.get("pics").and_then(Value::as_array) {
-            let images = download_dynamic_images(pictures, generator.width(), 10).await?;
-
-            let num_pics_per_line = match images.len() {
-                1 => 1,
-                2 | 4 => 2,
-                _ => 3,
-            };
-
-            let image_lines: Vec<&[RgbaImage]> = images.chunks(num_pics_per_line).collect();
-
-            let (mut x, mut y) = (generator.x(), generator.y());
-
-            for line in image_lines {
-                for (i, img) in line.iter().enumerate() {
-                    generator.draw_img(img, Some((x, y)));
-
-                    x += img.width() + 10;
-                    generator.set_x(x);
-
-                    if i == line.len() - 1 {
-                        y += img.height() + 10;
-                        generator.set_y(y);
-                        x = 10;
-                        generator.set_x(x);
-                    }
-                }
-            }
-
-            // bottom margin
-            generator.set_y(y + 20);
-        } else {
-            warn!(
-                "没有找到图片动态的图片定义，请检查可能的API变动，动态详细内容: {}",
-                detail_response
-            );
-        }
-    }
-
-    generator.crop_bottom();
-
-    let image = generator.into_image();
-
+    // 图片base64编码传到qq API
     let mut png_buffer = Vec::new();
     let mut cursor = Cursor::new(&mut png_buffer);
     image.write_to(&mut cursor, image::ImageFormat::Png)?;
@@ -400,13 +262,27 @@ async fn create_message_from_dynamic(
     // 构造QQ消息链
     let mut messages = Vec::new();
 
-    messages.push(Message::Plain {
-        text: format!(
-            "{} 发表了新动态:\n\nhttps://t.bilibili.com/{}\n\n",
-            uname, dynamic_id,
+    let header = match &dynamic.content {
+        Content::Forward {
+            texts: _,
+            original_author: _,
+            original: _,
+        } => {
+            format!(
+                "{} 转发了动态\nhttps://t.bilibili.com/{}\n",
+                dynamic.author.uname, dynamic_id
+            )
+        }
+        Content::Draw { texts: _, pics: _ } => format!(
+            "{} 发表了新动态\nhttps://t.bilibili.com/{}\n",
+            dynamic.author.uname, dynamic_id
         ),
-    });
-
+        Content::Word { texts: _ } => format!(
+            "{} 发表了新动态\nhttps://t.bilibili.com/{}\n",
+            dynamic.author.uname, dynamic_id
+        ),
+    };
+    messages.push(Message::Plain { text: header });
     messages.push(Message::Image { base64: image_b64 });
 
     Ok(messages)
@@ -498,6 +374,273 @@ async fn send_qq_message(
     }
 
     Ok(())
+}
+
+#[derive(Debug)]
+struct BiliDynamic {
+    author: AuthorInfo,
+    content: Content,
+}
+
+#[derive(Debug)]
+struct AuthorInfo {
+    uname: String,
+    vip: bool,
+    publish_timestamp: i64,
+    avatar_image: RgbaImage,
+}
+
+#[derive(Debug)]
+enum Content {
+    // 转发动态
+    Forward {
+        texts: Vec<RichTextNode>,
+        original_author: String,
+        original: Box<Content>,
+    },
+    // 带图动态
+    Draw {
+        texts: Vec<RichTextNode>,
+        pics: Vec<RgbaImage>,
+    },
+    // 纯文字动态
+    Word {
+        texts: Vec<RichTextNode>,
+    },
+}
+
+impl BiliDynamic {
+    async fn fetch(
+        bili: &BiliConfig,
+        client: &Client,
+        dynamic_id: i64,
+    ) -> anyhow::Result<BiliDynamic> {
+        let detail_response: Value =  client
+                        .get(format!("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id={}&features=itemOpusStyle,opusBigCover,onlyfansVote", dynamic_id))
+                        .header("COOKIE", format!("SESSDATA={}", bili.sess_data))
+                        .send()
+                        .await?
+                        .json()
+                        .await?;
+
+        let item = &detail_response["data"]["item"];
+
+        // 构建作者
+        let author_info = &item["modules"]["module_author"];
+        let uname = author_info["name"].as_str().unwrap().to_string();
+        let face_url = author_info.get("face").and_then(Value::as_str);
+        let face_image = if let Some(face_url) = face_url {
+            download_image(face_url).await?
+        } else {
+            RESOURCE.no_face_image.clone()
+        };
+        let vip = author_info
+            .get("vip")
+            .and_then(|v| v.get("nickname_color"))
+            .and_then(|c| c.as_str())
+            .map(|s| !s.is_empty())
+            .unwrap_or_default();
+        let timestamp = author_info
+            .get("pub_ts")
+            .and_then(|v| v.as_i64())
+            .unwrap_or_default();
+        let author = AuthorInfo {
+            uname,
+            vip,
+            publish_timestamp: timestamp,
+            avatar_image: face_image,
+        };
+
+        // 构建内容
+        let content = Content::from_detail_json(bili, client, item).await?;
+
+        Ok(BiliDynamic { author, content })
+    }
+}
+
+impl Content {
+    /// * `response["data"]["item"]` field of response from dynamic detail API https://api.bilibili.com/x/polymer/web-dynamic/v1/detail
+    async fn from_detail_json(
+        bili: &BiliConfig,
+        client: &Client,
+        item: &Value,
+    ) -> anyhow::Result<Content> {
+        let dynamic_type = item["type"].as_str().unwrap();
+        match dynamic_type {
+            DYNAMIC_TYPE_FORWARD => {
+                let raw_text_nodes = item["modules"]["module_dynamic"]["desc"]["rich_text_nodes"]
+                    .as_array()
+                    .unwrap();
+                let texts = build_text_nodes(None, raw_text_nodes).await?;
+
+                let orig_author = item["orig"]["modules"]["module_author"]["name"]
+                    .as_str()
+                    .unwrap()
+                    .to_string();
+                let orig = Box::pin(Content::from_detail_json(bili, client, &item["orig"])).await?;
+
+                Ok(Content::Forward {
+                    texts,
+                    original_author: orig_author,
+                    original: Box::new(orig),
+                })
+            }
+            DYNAMIC_TYPE_DRAW => {
+                let opus = &item["modules"]["module_dynamic"]["major"]["opus"];
+                let title = opus["title"].as_str().map(str::to_string);
+                let raw_text_nodes = opus["summary"]["rich_text_nodes"].as_array().unwrap();
+                let texts = build_text_nodes(title, raw_text_nodes).await?;
+
+                let pics = match opus["pics"].as_array() {
+                    Some(pics) => download_dynamic_images(pics, 740, 10).await?,
+                    None => Vec::new(),
+                };
+
+                Ok(Content::Draw { texts, pics })
+            }
+            DYNAMIC_TYPE_WORD => {
+                let opus = &item["modules"]["module_dynamic"]["major"]["opus"];
+                let title = opus["title"].as_str().map(str::to_string);
+                let raw_text_nodes = opus["summary"]["rich_text_nodes"].as_array().unwrap();
+                let texts = build_text_nodes(title, raw_text_nodes).await?;
+
+                Ok(Content::Word { texts })
+            }
+            _ => Err(anyhow!("不支持的动态类型: {}", dynamic_type)),
+        }
+    }
+}
+
+fn draw_dynamic(dynamic: &BiliDynamic) -> RgbaImage {
+    let mut generator = PicGenerator::new(740, 10000);
+    generator.draw_rectangle(0, 0, 10000, 740, WHITE);
+
+    // 绘制用户头像
+    let resized_face =
+        imageops::resize(&dynamic.author.avatar_image, 100, 100, FilterType::Lanczos3);
+    let circular_face = create_circular_image(&resized_face, 100);
+    generator.draw_img_alpha(&circular_face, Some((50, 50)));
+    // 绘制大会员下标
+    if dynamic.author.vip {
+        generator.draw_img_alpha(&RESOURCE.vip_image, Some((118, 118)));
+    }
+    generator.set_pos(175, 60);
+    let uname_color = if dynamic.author.vip { PINK } else { BLACK };
+    let ts = {
+        // 东8区时间
+        let tz = TimeZone::fixed(Offset::constant(8));
+        let ts = Timestamp::from_second(dynamic.author.publish_timestamp).unwrap();
+        let zoned_ts = ts.to_zoned(tz);
+        strtime::format("%Y-%m-%d %H:%M", &zoned_ts).unwrap()
+    };
+    // 绘制用户名和动态时间戳
+    generator.draw_text(
+        &[&dynamic.author.uname],
+        &[uname_color],
+        &RESOURCE.text_normal_font,
+        TEXT_SCALE,
+        None,
+    );
+    generator.draw_text(&[&ts], &[GRAY], &RESOURCE.text_normal_font, TIP_SCALE, None);
+
+    // 开始绘制动态内容
+    generator.set_x(25);
+    generator.set_row_space(10);
+
+    draw_content(&mut generator, &dynamic.content);
+
+    generator.crop_bottom();
+
+    generator.into_image()
+}
+
+fn draw_content(generator: &mut PicGenerator, content: &Content) {
+    match content {
+        Content::Forward {
+            texts,
+            original_author,
+            original,
+        } => {
+            let text_images = draw_content_image(
+                texts,
+                generator.width() - 50,
+                TEXT_SCALE,
+                EMOJI_SCALE,
+                &RESOURCE,
+            );
+            for image in text_images {
+                generator.draw_img_alpha(&image, None);
+            }
+
+            // 绘制原动态的灰色背景
+            let y = generator.y();
+            generator.draw_rectangle(0, y, generator.height() - y, generator.width(), LIGHT_GRAY);
+            // 绘制原作者AT
+            let orig_author_at = format!("@{}", original_author);
+            generator.draw_text(
+                &[&orig_author_at],
+                &[DEEP_BLUE],
+                &RESOURCE.text_normal_font,
+                TEXT_SCALE,
+                None,
+            );
+            // 绘制原动态内容
+            draw_content(generator, original);
+        }
+        Content::Draw { texts, pics } => {
+            let text_images = draw_content_image(
+                texts,
+                generator.width() - 50,
+                TEXT_SCALE,
+                EMOJI_SCALE,
+                &RESOURCE,
+            );
+            for image in text_images {
+                generator.draw_img_alpha(&image, None);
+            }
+
+            let num_pics_per_line = match pics.len() {
+                1 => 1,
+                2 | 4 => 2,
+                _ => 3,
+            };
+
+            let image_lines: Vec<&[RgbaImage]> = pics.chunks(num_pics_per_line).collect();
+
+            let (mut x, mut y) = (generator.x(), generator.y());
+
+            for line in image_lines {
+                for (i, img) in line.iter().enumerate() {
+                    generator.draw_img(img, Some((x, y)));
+
+                    x += img.width() + 10;
+                    generator.set_x(x);
+
+                    if i == line.len() - 1 {
+                        y += img.height() + 10;
+                        generator.set_y(y);
+                        x = 10;
+                        generator.set_x(x);
+                    }
+                }
+            }
+
+            // bottom margin
+            generator.set_y(y + 20);
+        }
+        Content::Word { texts } => {
+            let text_images = draw_content_image(
+                texts,
+                generator.width() - 50,
+                TEXT_SCALE,
+                EMOJI_SCALE,
+                &RESOURCE,
+            );
+            for image in text_images {
+                generator.draw_img_alpha(&image, None);
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
