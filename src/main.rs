@@ -50,6 +50,7 @@ const DEEP_BLUE: Rgba<u8> = Rgba::<u8>([175, 238, 238, 255]);
 const DYNAMIC_TYPE_DRAW: &str = "DYNAMIC_TYPE_DRAW"; // 带图动态
 const DYNAMIC_TYPE_FORWARD: &str = "DYNAMIC_TYPE_FORWARD"; //转发动态
 const DYNAMIC_TYPE_WORD: &str = "DYNAMIC_TYPE_WORD"; // 纯文字动态
+const DYNAMIC_TYPE_LIVE: &str = "DYNAMIC_TYPE_LIVE"; // 直播动态
 
 #[derive(Debug)]
 enum RichTextNode {
@@ -205,7 +206,7 @@ async fn run_target(
             let dynamic_id = desc["dynamic_id"].as_i64().unwrap();
             let dynamic_type = desc.get("type").unwrap().as_i64().unwrap();
 
-            if dynamic_type != 2 && dynamic_type != 4 && dynamic_type != 1 {
+            if dynamic_type != 2 && dynamic_type != 4 && dynamic_type != 1 && dynamic_type != 4200 {
                 debug!("跳过不支持的动态类型 {} ({})", dynamic_id, dynamic_type);
                 continue;
             }
@@ -283,6 +284,14 @@ async fn create_message_from_dynamic(
         Content::Word { texts: _ } => format!(
             "{} 发表了新动态\nhttps://t.bilibili.com/{}\n",
             dynamic.author.uname, dynamic_id
+        ),
+        Content::Live {
+            live_id,
+            live_title: _,
+            live_cover: _,
+        } => format!(
+            "{} 直播了\nhttps://live.bilibili.com/{}\n",
+            dynamic.author.uname, live_id
         ),
     };
     messages.push(Message::Plain { text: header });
@@ -410,6 +419,12 @@ enum Content {
     Word {
         texts: Vec<RichTextNode>,
     },
+    // 直播动态
+    Live {
+        live_id: i64,
+        live_title: String,
+        live_cover: RgbaImage,
+    },
 }
 
 impl BiliDynamic {
@@ -508,6 +523,20 @@ impl Content {
                 let texts = build_text_nodes(title, raw_text_nodes).await?;
 
                 Ok(Content::Word { texts })
+            }
+            DYNAMIC_TYPE_LIVE => {
+                let live = &item["modules"]["module_dynamic"]["major"]["live"];
+                let live_id = live["id"].as_i64().unwrap();
+                let live_title = live["title"].as_str().unwrap().to_string();
+                let live_cover_url =
+                    format!("{}@203w_127h_1e_1c.webp", live["cover"].as_str().unwrap());
+                let live_cover = download_image(live_cover_url).await?;
+
+                Ok(Content::Live {
+                    live_id,
+                    live_title,
+                    live_cover,
+                })
             }
             _ => Err(anyhow!("不支持的动态类型: {}", dynamic_type)),
         }
@@ -642,6 +671,20 @@ fn draw_content(generator: &mut PicGenerator, content: &Content) {
             for image in text_images {
                 generator.draw_img_alpha(&image, None);
             }
+        }
+        Content::Live {
+            live_id: _,
+            live_title,
+            live_cover,
+        } => {
+            generator.draw_text(
+                &[live_title],
+                &[BLACK],
+                &RESOURCE.text_normal_font,
+                TEXT_SCALE,
+                None,
+            );
+            generator.draw_img(live_cover, None);
         }
     }
 }
@@ -989,4 +1032,22 @@ pub async fn download_dynamic_images(
     }
 
     Ok(images)
+}
+
+// I use this as a quick hack to look up dynamic details
+#[tokio::test]
+async fn test_get_detail() {
+    let client = reqwest::Client::new();
+    let dynamic_id: i64 = 729922047097962504;
+    let sess_data = "SESSDATA";
+    let detail_response: Value =  client
+                        .get(format!("https://api.bilibili.com/x/polymer/web-dynamic/v1/detail?timezone_offset=-480&id={}&features=itemOpusStyle,opusBigCover,onlyfansVote", dynamic_id))
+                        .header("COOKIE", format!("SESSDATA={}", sess_data))
+                        .send()
+                        .await.unwrap()
+                        .json()
+                        .await.unwrap();
+
+    let s = serde_json::to_string_pretty(&detail_response).unwrap();
+    println!("{}", s)
 }
