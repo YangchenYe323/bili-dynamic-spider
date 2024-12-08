@@ -145,18 +145,21 @@ async fn run_target(
             if !entry.sent {
                 info!("重发动态 {}", dynamic_id);
 
-                let messages = create_message_from_dynamic(&bili, &client, dynamic_id).await?;
+                match create_message_from_dynamic(&bili, &client, dynamic_id).await {
+                    Ok(msg) => match send_qq_message(&mirai, &target, &client, msg).await {
+                        Ok(_) => {
+                            entry.sent = true;
 
-                match send_qq_message(&mirai, &target, &client, messages).await {
-                    Ok(_) => {
-                        entry.sent = true;
+                            let v = serde_json::to_vec(&entry).unwrap();
 
-                        let v = serde_json::to_vec(&entry).unwrap();
-
-                        resent_entries.push((k, v));
-                    }
+                            resent_entries.push((k, v));
+                        }
+                        Err(e) => {
+                            error!("重发错过的动态失败: {}", e)
+                        }
+                    },
                     Err(e) => {
-                        error!("重发错过的动态失败: {}", e);
+                        error!("无法创建消息: {}", e);
                     }
                 }
             }
